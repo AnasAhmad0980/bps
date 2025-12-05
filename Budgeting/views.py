@@ -1,25 +1,512 @@
-# Create your views here.
-from django.shortcuts import render, redirect
+from django.shortcuts import render, redirect, get_object_or_404
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth import get_user_model
+from django.contrib import messages
+from django.utils import timezone
+from datetime import datetime, timedelta
+from decimal import Decimal
+from .models import MonthlyBudget, Category, Transaction, DailySummary, MonthlySummary, Goal
 
 User = get_user_model()
 
 @login_required(login_url='login')
 def dashboard(request):
-    """Main dashboard with budget, calendar, goals, etc."""
+    """Main dashboard with budget overview"""
     user = request.user
     
-    # TODO: Get user's budgets, transactions, goals when models are ready
-    # monthly_budget = MonthlyBudget.objects.filter(user=user).first()
-    # goals = Goal.objects.filter(user=user)
-    # recent_transactions = Transaction.objects.filter(user=user).order_by('-date')[:5]
+    # Get active budget or most recent budget
+    active_budget = MonthlyBudget.objects.filter(user=user, is_active=True).first()
     
+    if not active_budget:
+        # Check if user has any budgets at all
+        has_budgets = MonthlyBudget.objects.filter(user=user).exists()
+        if not has_budgets:
+            # First time user - redirect to budget setup
+            return redirect('budget_setup')
+        else:
+            # User has old budgets but none active
+            active_budget = MonthlyBudget.objects.filter(user=user).first()
+    
+    # Get recent transactions
+    recent_transactions = Transaction.objects.filter(
+        monthly_budget=active_budget
+    ).order_by('-date', '-created_at')[:10] if active_budget else []
+    
+    # Get goals
+    goals = Goal.objects.filter(user=user, is_completed=False)[:5]
+    
+    # Calculate statistics
     context = {
         'user': user,
-        # 'monthly_budget': monthly_budget,
-        # 'goals': goals,
-        # 'recent_transactions': recent_transactions,
+        'active_budget': active_budget,
+        'recent_transactions': recent_transactions,
+        'goals': goals,
     }
     
+    if active_budget:
+        context.update({
+            'total_budget': active_budget.total_budget,
+            'total_spent': active_budget.get_total_spent(),
+            'total_income': active_budget.get_total_income(),
+            'remaining_balance': active_budget.get_remaining_balance(),
+            'categories_summary': active_budget.get_categories_summary(),
+        })
+    
     return render(request, 'Budgeting/dashboard.html', context)
+
+
+@login_required(login_url='login')
+def budget_setup(request):
+    """Setup monthly budget and categories"""
+    user = request.user
+    
+    # Check if user already has an active budget
+    active_budget = MonthlyBudget.objects.filter(user=user, is_active=True).first()
+    
+    if request.method == 'POST':
+        # Get form data
+        total_budget = request.POST.get('total_budget')
+        start_date = request.POST.get('start_date')
+        
+        # Validation
+        errors = []
+        
+        if not total_budget:
+            errors.append('Total budget is required')
+        else:
+            try:
+                total_budget = Decimal(total_budget)
+                if total_budget <= 0:
+                    errors.append('Total budget must be greater than 0')
+            except:
+                errors.append('Invalid budget amount')
+        
+        if not start_date:
+            errors.append('Start date is required')
+        else:
+            try:
+                start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+            except:
+                errors.append('Invalid date format')
+        
+        if errors:
+            return render(request, 'Budgeting/budget_setup.html', {
+                'errors': errors,
+                'total_budget': request.POST.get('total_budget'),
+                'start_date': request.POST.get('start_date'),
+                'active_budget': active_budget,
+            })
+        
+        # Deactivate previous active budgets
+        MonthlyBudget.objects.filter(user=user, is_active=True).update(is_active=False)
+        
+        # Create new budget
+        budget = MonthlyBudget.objects.create(
+            user=user,
+            start_date=start_date,
+            total_budget=total_budget,
+            is_active=True
+        )
+        
+        messages.success(request, 'Budget created successfully! Now add categories.')
+        return redirect('category_setup', budget_id=budget.budgetId)
+    
+    return render(request, 'Budgeting/budget_setup.html', {
+        'active_budget': active_budget,
+    })
+
+
+@login_required(login_url='login')
+def category_setup(request, budget_id):
+    """Setup budget categories"""
+    budget = get_object_or_404(MonthlyBudget, budgetId=budget_id, user=request.user)
+    
+    # Get existing categories
+    existing_categories = Category.objects.filter(monthly_budget=budget)
+    
+    # Predefined categories
+    predefined = Category.PREDEFINED_CATEGORIES
+    
+    if request.method == 'POST':
+        action = request.POST.get('action')
+        
+        if action == 'add_predefined':
+            # Add predefined category
+            category_type = request.POST.get('category_type')
+            allocated_amount = request.POST.get('allocated_amount')
+            
+            errors = []
+            
+            if not category_type:
+                errors.append('Please select a category')
+            
+            if not allocated_amount:
+                errors.append('Allocated amount is required')
+            else:
+                try:
+                    allocated_amount = Decimal(allocated_amount)
+                    if allocated_amount <= 0:
+                        errors.append('Amount must be greater than 0')
+                except:
+                    errors.append('Invalid amount')
+            
+            if not errors:
+                # Get category name from predefined list
+                category_name = dict(predefined).get(category_type, 'Unknown')
+                
+                # Check if category already exists
+                if not Category.objects.filter(monthly_budget=budget, category_type=category_type).exists():
+                    Category.objects.create(
+                        monthly_budget=budget,
+                        category_name=category_name,
+                        category_type=category_type,
+                        allocated_amount=allocated_amount,
+                        is_custom=False
+                    )
+                    messages.success(request, f'Category "{category_name}" added successfully!')
+                else:
+                    messages.warning(request, f'Category "{category_name}" already exists!')
+                
+                return redirect('category_setup', budget_id=budget_id)
+        
+        elif action == 'add_custom':
+            # Add custom category
+            category_name = request.POST.get('custom_category_name', '').strip()
+            allocated_amount = request.POST.get('custom_allocated_amount')
+            
+            errors = []
+            
+            if not category_name:
+                errors.append('Category name is required')
+            
+            if not allocated_amount:
+                errors.append('Allocated amount is required')
+            else:
+                try:
+                    allocated_amount = Decimal(allocated_amount)
+                    if allocated_amount <= 0:
+                        errors.append('Amount must be greater than 0')
+                except:
+                    errors.append('Invalid amount')
+            
+            if not errors:
+                Category.objects.create(
+                    monthly_budget=budget,
+                    category_name=category_name,
+                    allocated_amount=allocated_amount,
+                    is_custom=True
+                )
+                messages.success(request, f'Custom category "{category_name}" added successfully!')
+                return redirect('category_setup', budget_id=budget_id)
+        
+        elif action == 'finish':
+            # Finish setup and go to dashboard
+            messages.success(request, 'Budget setup completed!')
+            return redirect('budgeting_dashboard')
+    
+    # Calculate total allocated
+    total_allocated = sum(cat.allocated_amount for cat in existing_categories)
+    remaining = budget.total_budget - total_allocated
+    
+    context = {
+        'budget': budget,
+        'existing_categories': existing_categories,
+        'predefined_categories': predefined,
+        'total_allocated': total_allocated,
+        'remaining': remaining,
+    }
+    
+    return render(request, 'Budgeting/category_setup.html', context)
+
+
+@login_required(login_url='login')
+def delete_category(request, category_id):
+    """Delete a category"""
+    category = get_object_or_404(Category, categoryId=category_id, monthly_budget__user=request.user)
+    budget_id = category.monthly_budget.budgetId
+    
+    # Check if category has transactions
+    if category.transactions.exists():
+        messages.error(request, f'Cannot delete "{category.category_name}" because it has transactions.')
+    else:
+        category_name = category.category_name
+        category.delete()
+        messages.success(request, f'Category "{category_name}" deleted successfully!')
+    
+    return redirect('category_setup', budget_id=budget_id)
+
+
+@login_required(login_url='login')
+def transactions_list(request):
+    """View all transactions"""
+    user = request.user
+    active_budget = MonthlyBudget.objects.filter(user=user, is_active=True).first()
+    
+    if not active_budget:
+        messages.warning(request, 'Please set up your budget first.')
+        return redirect('budget_setup')
+    
+    # Get all transactions for active budget
+    transactions = Transaction.objects.filter(monthly_budget=active_budget).order_by('-date', '-created_at')
+    
+    # Filter by type if specified
+    filter_type = request.GET.get('type')
+    if filter_type in ['income', 'expense']:
+        transactions = transactions.filter(transaction_type=filter_type)
+    
+    # Filter by category if specified
+    category_id = request.GET.get('category')
+    if category_id:
+        transactions = transactions.filter(category_id=category_id)
+    
+    categories = Category.objects.filter(monthly_budget=active_budget)
+    
+    context = {
+        'active_budget': active_budget,
+        'transactions': transactions,
+        'categories': categories,
+        'filter_type': filter_type,
+        'filter_category': category_id,
+    }
+    
+    return render(request, 'Budgeting/transactions_list.html', context)
+
+
+@login_required(login_url='login')
+def add_transaction(request):
+    """Add a new transaction (income or expense)"""
+    user = request.user
+    active_budget = MonthlyBudget.objects.filter(user=user, is_active=True).first()
+    
+    if not active_budget:
+        messages.warning(request, 'Please set up your budget first.')
+        return redirect('budget_setup')
+    
+    categories = Category.objects.filter(monthly_budget=active_budget)
+    
+    if request.method == 'POST':
+        transaction_type = request.POST.get('transaction_type')
+        amount = request.POST.get('amount')
+        category_id = request.POST.get('category')
+        date = request.POST.get('date')
+        note = request.POST.get('note', '').strip()
+        
+        errors = []
+        
+        if not transaction_type or transaction_type not in ['income', 'expense']:
+            errors.append('Please select transaction type')
+        
+        if not amount:
+            errors.append('Amount is required')
+        else:
+            try:
+                amount = Decimal(amount)
+                if amount <= 0:
+                    errors.append('Amount must be greater than 0')
+            except:
+                errors.append('Invalid amount')
+        
+        if transaction_type == 'expense' and not category_id:
+            errors.append('Category is required for expenses')
+        
+        if not date:
+            errors.append('Date is required')
+        else:
+            try:
+                date = datetime.strptime(date, '%Y-%m-%d').date()
+            except:
+                errors.append('Invalid date format')
+        
+        if errors:
+            return render(request, 'Budgeting/add_transaction.html', {
+                'errors': errors,
+                'categories': categories,
+                'form_data': request.POST,
+            })
+        
+        # Create transaction
+        transaction = Transaction.objects.create(
+            monthly_budget=active_budget,
+            transaction_type=transaction_type,
+            amount=amount,
+            category_id=category_id if category_id else None,
+            date=date,
+            note=note
+        )
+        
+        # Update daily summary
+        DailySummary.update_or_create_for_date(active_budget, date)
+        
+        # Update monthly summary
+        MonthlySummary.update_or_create_for_budget(active_budget)
+        
+        messages.success(request, f'{transaction_type.capitalize()} of {amount} added successfully!')
+        return redirect('transactions_list')
+    
+    context = {
+        'categories': categories,
+        'today': timezone.now().date(),
+    }
+    
+    return render(request, 'Budgeting/add_transaction.html', context)
+
+
+@login_required(login_url='login')
+def edit_transaction(request, transaction_id):
+    """Edit an existing transaction"""
+    transaction = get_object_or_404(Transaction, transactionId=transaction_id, monthly_budget__user=request.user)
+    active_budget = transaction.monthly_budget
+    categories = Category.objects.filter(monthly_budget=active_budget)
+    
+    if request.method == 'POST':
+        transaction_type = request.POST.get('transaction_type')
+        amount = request.POST.get('amount')
+        category_id = request.POST.get('category')
+        date = request.POST.get('date')
+        note = request.POST.get('note', '').strip()
+        
+        errors = []
+        
+        if not transaction_type or transaction_type not in ['income', 'expense']:
+            errors.append('Please select transaction type')
+        
+        if not amount:
+            errors.append('Amount is required')
+        else:
+            try:
+                amount = Decimal(amount)
+                if amount <= 0:
+                    errors.append('Amount must be greater than 0')
+            except:
+                errors.append('Invalid amount')
+        
+        if transaction_type == 'expense' and not category_id:
+            errors.append('Category is required for expenses')
+        
+        if not date:
+            errors.append('Date is required')
+        else:
+            try:
+                date = datetime.strptime(date, '%Y-%m-%d').date()
+            except:
+                errors.append('Invalid date format')
+        
+        if errors:
+            return render(request, 'Budgeting/edit_transaction.html', {
+                'errors': errors,
+                'transaction': transaction,
+                'categories': categories,
+            })
+        
+        # Store old date for summary updates
+        old_date = transaction.date
+        
+        # Update transaction
+        transaction.transaction_type = transaction_type
+        transaction.amount = amount
+        transaction.category_id = category_id if category_id else None
+        transaction.date = date
+        transaction.note = note
+        transaction.save()
+        
+        # Update daily summaries (both old and new dates)
+        DailySummary.update_or_create_for_date(active_budget, old_date)
+        if old_date != date:
+            DailySummary.update_or_create_for_date(active_budget, date)
+        
+        # Update monthly summary
+        MonthlySummary.update_or_create_for_budget(active_budget)
+        
+        messages.success(request, 'Transaction updated successfully!')
+        return redirect('transactions_list')
+    
+    context = {
+        'transaction': transaction,
+        'categories': categories,
+    }
+    
+    return render(request, 'Budgeting/edit_transaction.html', context)
+
+
+@login_required(login_url='login')
+def delete_transaction(request, transaction_id):
+    """Delete a transaction"""
+    transaction = get_object_or_404(Transaction, transactionId=transaction_id, monthly_budget__user=request.user)
+    
+    if request.method == 'POST':
+        active_budget = transaction.monthly_budget
+        date = transaction.date
+        
+        transaction.delete()
+        
+        # Update daily summary
+        DailySummary.update_or_create_for_date(active_budget, date)
+        
+        # Update monthly summary
+        MonthlySummary.update_or_create_for_budget(active_budget)
+        
+        messages.success(request, 'Transaction deleted successfully!')
+        return redirect('transactions_list')
+    
+    return render(request, 'Budgeting/delete_transaction.html', {'transaction': transaction})
+
+
+@login_required(login_url='login')
+def quick_add_transaction(request):
+    """Quick add transaction (AJAX-friendly)"""
+    user = request.user
+    active_budget = MonthlyBudget.objects.filter(user=user, is_active=True).first()
+    
+    if not active_budget:
+        messages.warning(request, 'Please set up your budget first.')
+        return redirect('budget_setup')
+    
+    categories = Category.objects.filter(monthly_budget=active_budget)
+    
+    if request.method == 'POST':
+        transaction_type = request.POST.get('transaction_type')
+        amount = request.POST.get('amount')
+        category_id = request.POST.get('category')
+        note = request.POST.get('note', '').strip()
+        
+        errors = []
+        
+        if not transaction_type or transaction_type not in ['income', 'expense']:
+            errors.append('Please select transaction type')
+        
+        if not amount:
+            errors.append('Amount is required')
+        else:
+            try:
+                amount = Decimal(amount)
+                if amount <= 0:
+                    errors.append('Amount must be greater than 0')
+            except:
+                errors.append('Invalid amount')
+        
+        if transaction_type == 'expense' and not category_id:
+            errors.append('Category is required for expenses')
+        
+        if not errors:
+            # Create transaction with today's date
+            transaction = Transaction.objects.create(
+                monthly_budget=active_budget,
+                transaction_type=transaction_type,
+                amount=amount,
+                category_id=category_id if category_id else None,
+                date=timezone.now().date(),
+                note=note
+            )
+            
+            # Update summaries
+            DailySummary.update_or_create_for_date(active_budget, timezone.now().date())
+            MonthlySummary.update_or_create_for_budget(active_budget)
+            
+            messages.success(request, f'{transaction_type.capitalize()} added successfully!')
+            return redirect('budgeting_dashboard')
+    
+    context = {
+        'categories': categories,
+    }
+    
+    return render(request, 'Budgeting/quick_add_transaction.html', context)
